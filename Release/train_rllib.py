@@ -39,7 +39,11 @@ from dogfight.ai.rllib_utils import build_algorithm_config, normalize_algorithm_
 from dogfight.ai.student_hooks import load_observation_hook, load_reward_hook
 from dogfight.ai.training_record import save_training_record
 
-
+"""
+ensure_ray_runtime_env(): Ray를 초기화할 때, 병렬로 실행되는 수많은 워커 프로세스(Worker Actors)들이
+우리가 짠 student/ 폴더 내 모듈들을 못 찾아서 터지는 ModuleNotFoundError를 원천 차단하기 위해
+런타임 환경 변수로 PYTHONPATH를 강제 복사해 줍니다.
+"""
 def _ensure_ray_runtime_env() -> None:
     """Restart Ray with local project paths available to worker actors."""
     import ray
@@ -51,7 +55,13 @@ def _ensure_ray_runtime_env() -> None:
         runtime_env={"env_vars": {"PYTHONPATH": os.environ["PYTHONPATH"]}},
     )
 
-
+"""
+env_creator: 
+RLlib이 병렬로 환경을 복제할 때 호출하는 팩토리 함수입니다. 
+우리가 --observation-module student.my_observation이라고 치면, 
+이 함수가 우리 코드를 파싱해서 관측 차원 크기(size), 상하한선(low, high), 그리고 실제 상태 행렬을 빌드하는 함수(build_observation)를 뜯어내어
+DogFightWrapper에 계약(Contract) 조건으로 조립해 줍니다.
+"""
 def env_creator(env_config):
     cfg = dict(env_config)
     cfg["_runner_index"] = getattr(
