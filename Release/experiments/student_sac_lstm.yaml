@@ -88,8 +88,10 @@ runtime:
   num_envs_per_env_runner: 1
   rollout_fragment_length: 8
   batch_mode: truncate_episodes
-  checkpoint_frequency: 0
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 0
   save_native_checkpoint: false
+  native_checkpoint_frequency: 0
   # 학습 재개:
   # init_bundle: artifacts/models/team01/sac_lstm_actor_critic_v1
   # restore_checkpoint: artifacts/checkpoints/team01/sac_lstm_actor_critic_v1/checkpoint_000010

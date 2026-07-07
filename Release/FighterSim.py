@@ -235,87 +235,6 @@ class JSBSim(Sim):
         #If FDM updating is success, return True
         return True
     
-    
-        
-    def _get_target_state(self, out_fdm):
-        #convert LLA -> NED
-        #If JSBSim fdm retuns over range, print message.
-        lat = out_fdm.Lat/1000000.0
-        lon = out_fdm.Lon/1000000.0
-        alt = out_fdm.Alt/1000
-        if abs( lat ) > 90.0 or abs( lon) > 180.0 or alt < 0.0 :
-            print("fdm ouput over range!!!! LAT{}  LON{}  ALT{}".format(lat, lon, alt) )            
-            self.fdm_update_success = False
-            return
-      
-        ned = pm.geodetic2ned(lat, lon, alt * FEET_TO_METER, self._origin_lat, self._origin_lon, self._origin_alt)#V0.4
-        
-        ########################### Position ############################
-        self._target_state[0] = ned[0] #N :My Aircraft Position NED North /meter
-        self._target_state[1] = ned[1] #E :My Aircraft Position NED East  /meter
-        self._target_state[2] = ned[2] #D :My Aircraft Position NED Down  /meter
-        ########################### Attitude ############################
-        self._target_state[3] = out_fdm.phi/1000   #Roll  :Euler Angle - Phi(Nose direction +, right-hand rule)         /deg(-180 ~ 180)
-        self._target_state[4] = out_fdm.theta/1000 #Pitch :Euler Angle - Theta(Right-wing direction +, right-hand rule) /deg(-180 ~ 180) 
-        self._target_state[5] = out_fdm.psi/1000   #Yaw   :Euler Angel - Psi(Down direction +, right-hand rule)         /deg(-180 ~ 180)        
-        ########################### Velocity ############################
-        self._target_state[6] = out_fdm.u/1000 * FEET_TO_METER  #u :body x axis Velocity (Nose direction +, right-hand rule)       / meter/sec
-        self._target_state[7] = out_fdm.v/1000 * FEET_TO_METER  #v :body y axis Velocity (Right-wing direction +, right-hand rule) / meter/sec
-        self._target_state[8] = out_fdm.w/1000 * FEET_TO_METER  #w :body z axis Velocity (Down direction +, right-hand rule)       / meter/sec        
-        ########################### Angular Rate ############################
-        self._target_state[9]  = out_fdm.p/1000   #p :Aircraft Angular Rate - Roll (Nose direction +, right-hand rule)           / deg/sec
-        self._target_state[10] = out_fdm.q/1000   #q :Aircraft Angular Rate - Pitch (Right-wing direction +, right-hand rule)    / deg/sec
-        self._target_state[11] = out_fdm.r/1000   #r :Aircraft Angular Rate - Yaw (Down direction +, right-hand rule)/ deg/sec   / deg/sec        
-        ########################### Flight Info added ############################
-        self._target_state[12] = out_fdm.KCAS/10 * KNOT_TO_METER_SEC   #Calibated Air Speed / meter/sec(0~1028 m/s)  (cf. 1Knots->0.51444 m/s)          
-        self._target_state[13] = out_fdm.AOA #Angle of Attack( -90 ~ 90 ) /deg
-        self._target_state[14] = out_fdm.AOS #Angle of Sideslip( -90 ~ 90 ) /deg
-        ########################### Aileron Control Info ##################################
-        self._target_state[15] = out_fdm.LatCtrlCmd #Roll Stick Command (Generate Positive X-axis Moment +, RightTurn +)(-1 ~ 1)
-        self._target_state[16] = out_fdm.AileronPosition /500 #Aileron Deflection Angle(-60~60) /deg
-        ########################### Elevato Control Info ##################################
-        self._target_state[17] = out_fdm.LonCtrlCmd #Pitch Stick Command (Generate Positive Y-axis Moment +, PitchUp +) (-1 ~ 1)
-        self._target_state[18] = out_fdm.ElevatorPosition /500 #Elevator Deflection Angle(-60~60) /deg
-        ########################### Rudder Control Info. ##################################
-        self._target_state[19] = out_fdm.DirCtrlCmd #Rudder Pedal Command (Generate Positive Z-axis Moment +, RightTurn +)(-1 ~ 1) 
-        self._target_state[20] = out_fdm.RudderPosition /500 #Rudder Deflection Angle -60~60 /deg
-        ########################### Engine1 ##################################
-        self._target_state[21] = out_fdm.SpeedCtrlCmd1 #Throttle Slider 1 Command( -1 ~ 1 )
-        self._target_state[22] = out_fdm.Engine1_N1RPM #N1 RPM of Engine 1( 0 ~ 100 ) /RPM        
-        self._target_state[23] = out_fdm.Fuel #  /Fuel /LBS 
-        ########################### Accleration ##################################
-        self._target_state[24] = out_fdm.Ax/1000 * FEET_TO_METER #X body accel, meter/sec 
-        self._target_state[25] = out_fdm.Ay/1000 * FEET_TO_METER #Y body accel, meter/sec 
-        self._target_state[26] = out_fdm.Az/1000 * FEET_TO_METER #Z body accel, meter/sec         
-        ########################### Flight Info added ############################
-        self._target_state[27] = out_fdm.KTAS/10 * KNOT_TO_METER_SEC   #True AirSpeed( 0 ~ 1028) / meter/sec  (cf. 1Knots->0.51444 m/s) 
-        self._target_state[28] = out_fdm.GNDS/10 * KNOT_TO_METER_SEC   #Ground Speed( 0 ~ 1028)  / meter/sec  (cf. 1Knots->0.51444 m/s) 
-        self._target_state[29] = out_fdm.MachNum /1000   #Mach Number of Aircraft (0 ~ 4) 
-        self._target_state[30] = - out_fdm.VV * FEET_TO_METER  #Vertical Velocity(NED Down direction) meter/min 
-        self._target_state[31] = out_fdm.Nz/1000 #Normal Acceleration (-20 ~ 20 ) / G 
-        self._target_state[32] = out_fdm.Ny/1000 #Lateral Acceleration (-20 ~ 20 ) / G 
-        ########################### Engine1 added ############################
-        self._target_state[33] = out_fdm.Engine1_N2RPM #N2 RPM of Engine 1( 0 ~ 100 ) /RPM
-        self._target_state[34] = out_fdm.Engine1_FuelFlow/1000 #Fuel Flow of Engine 1(0~ ) / m^3/sec 
-        ########################### Engine2 ##################################
-        self._target_state[35] = out_fdm.SpeedCtrlCmd2 #Throttle Slider 2 Command( -1 ~ 1 )
-        self._target_state[36] = out_fdm.Engine2_N1RPM #N1 RPM of Engine 2( 0 ~ 100 ) /RPM
-        self._target_state[37] = out_fdm.Engine2_N2RPM #N2 RPM of Engine 2( 0 ~ 100 ) /RPM
-        self._target_state[38] = out_fdm.Engine2_FuelFlow/1000 #Fuel Flow of Engine 2(0~ ) / m^3/sec 
-        self._target_state[39] = out_fdm.SpeedBrakeCtrlCmd #SpeedBrake Retraction/Neutral/Extension Control Command( -1 ~ 1 ) cf.flight computer controls a speedbrake automatically
-        self._target_state[40] = out_fdm.SpeedBrakePosition/1000 #SpeedBrake Deflection Angle( 0 ~ 60 ) /deg 
-        ########################### Etc ##################################
-        self._target_state[41] = out_fdm.SimTime #Simulation Time(sec)
-        self._target_state[42] = out_fdm.Lat/1000000.0 # Lat(deg)
-        self._target_state[43] = out_fdm.Lon/1000000.0 # Lon(deg)
-        self._target_state[44] = out_fdm.Alt/1000.0 * FEET_TO_METER #Alt(meter)
-        self._target_state[45] = self._health #health
-        self._target_state[46] = 0 #reserved
-        self._target_state[47] = 0 #reserved
-        self._target_state[48] = 0 #reserved
-        self._target_state[49] = 0 #reserved
-        self._target_state[50] = 0 #reserved    
-    
     def get_state(self):
         """ return state """
         self._state
@@ -436,9 +355,6 @@ class JSBSim(Sim):
         if self._AIP is None:
             print("Rule Based AIP is none")
         else:
-            #self._get_target_state(target_sim_model.get_fdm_data())
-            #print_holdon(x=[self._state[42], self._state[43], self._state[44]],
-            #             y=[self._target_state[42], self._target_state[43], self._target_state[44]])
             
             _control_action = self._AIP.Step(
                 self._model.fighterID, 

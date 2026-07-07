@@ -37,13 +37,10 @@ from dogfight.ai.engagement_replay_logger import EngagementReplayLogger
 from dogfight.ai.policy_probe_logger import PolicyProbeLogger
 from dogfight.ai.rllib_utils import build_algorithm_config, normalize_algorithm_name
 from dogfight.ai.student_hooks import load_observation_hook, load_reward_hook
+from dogfight.ai.training.config_io import deep_update, load_experiment_env_config
 from dogfight.ai.training_record import save_training_record
 
-"""
-ensure_ray_runtime_env(): Ray를 초기화할 때, 병렬로 실행되는 수많은 워커 프로세스(Worker Actors)들이
-우리가 짠 student/ 폴더 내 모듈들을 못 찾아서 터지는 ModuleNotFoundError를 원천 차단하기 위해
-런타임 환경 변수로 PYTHONPATH를 강제 복사해 줍니다.
-"""
+
 def _ensure_ray_runtime_env() -> None:
     """Restart Ray with local project paths available to worker actors."""
     import ray
@@ -55,13 +52,7 @@ def _ensure_ray_runtime_env() -> None:
         runtime_env={"env_vars": {"PYTHONPATH": os.environ["PYTHONPATH"]}},
     )
 
-"""
-env_creator: 
-RLlib이 병렬로 환경을 복제할 때 호출하는 팩토리 함수입니다. 
-우리가 --observation-module student.my_observation이라고 치면, 
-이 함수가 우리 코드를 파싱해서 관측 차원 크기(size), 상하한선(low, high), 그리고 실제 상태 행렬을 빌드하는 함수(build_observation)를 뜯어내어
-DogFightWrapper에 계약(Contract) 조건으로 조립해 줍니다.
-"""
+
 def env_creator(env_config):
     cfg = dict(env_config)
     cfg["_runner_index"] = getattr(
@@ -483,36 +474,6 @@ def _resolve_dashboard_root(path: str) -> Path:
     return root if root.is_absolute() else ROOT / root
 
 
-def _deep_update(base: dict, updates: dict) -> dict:
-    """Recursively merge nested YAML config into the CLI-built env config."""
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _deep_update(base[key], value)
-        else:
-            base[key] = value
-    return base
-
-
-def _load_experiment_env_config(path: str) -> dict:
-    """Load optional env_config from the experiment YAML passed by run_experiment."""
-    if not path:
-        return {}
-    import yaml
-
-    exp_path = Path(path)
-    if not exp_path.is_absolute():
-        exp_path = (ROOT / exp_path).resolve()
-    data = yaml.safe_load(exp_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        return {}
-    env_config = data.get("env_config", {})
-    if env_config is None:
-        return {}
-    if not isinstance(env_config, dict):
-        raise ValueError("experiment YAML env_config must be a mapping")
-    return env_config
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train a single-agent dogfight policy with RLlib."
@@ -677,7 +638,33 @@ def parse_args():
     )
     parser.add_argument("--output-name", default="f16_single_agent")
     parser.add_argument("--output-tag", default="latest")
-    parser.add_argument("--notes", default="", help="Optional free-text notes for this training run.")
+    parser.add_argument(
+        "--notes",
+        default="",
+        help="Optional free-text notes for this training run.",
+    )
+    parser.add_argument(
+        "--save-lightweight-bundle",
+        dest="save_lightweight_bundle",
+        action="store_true",
+        default=True,
+        help="Save lightweight policy bundles for inference.",
+    )
+    parser.add_argument(
+        "--no-save-lightweight-bundle",
+        dest="save_lightweight_bundle",
+        action="store_false",
+        help="Disable lightweight policy bundle saves.",
+    )
+    parser.add_argument(
+        "--lightweight-bundle-frequency",
+        type=int,
+        default=0,
+        help=(
+            "Save a lightweight bundle every N direct-loop iterations. "
+            "0 means final bundle only."
+        ),
+    )
     parser.add_argument(
         "--save-native-checkpoint",
         action="store_true",
@@ -695,12 +682,28 @@ def parse_args():
         default="",
         help="Load lightweight policy bundle weights before fresh training.",
     )
-    parser.add_argument("--use-tune", action="store_true", help="Run training through Ray Tune/AIR.")
+    parser.add_argument(
+        "--use-tune",
+        action="store_true",
+        help="Run training through Ray Tune/AIR.",
+    )
     parser.add_argument(
         "--checkpoint-frequency",
         type=int,
         default=0,
-        help="Tune checkpoint frequency in training iterations.",
+        help=(
+            "Legacy native/Tune checkpoint frequency in training iterations. "
+            "Prefer --native-checkpoint-frequency for direct training."
+        ),
+    )
+    parser.add_argument(
+        "--native-checkpoint-frequency",
+        type=int,
+        default=None,
+        help=(
+            "Save an RLlib native checkpoint every N direct-loop iterations. "
+            "0 means final native checkpoint only when enabled."
+        ),
     )
     parser.add_argument(
         "--dashboard-logdir",
@@ -909,6 +912,88 @@ def _sync_lstm_args_from_init_bundle(args) -> None:
         )
 
 
+def _native_checkpoint_frequency(args) -> int:
+    """Return the native checkpoint interval, including the legacy alias."""
+    if args.native_checkpoint_frequency is not None:
+        return max(0, int(args.native_checkpoint_frequency))
+    return max(0, int(args.checkpoint_frequency))
+
+
+def _build_bundle_metadata(
+    args,
+    algorithm_name: str,
+    env_config: dict,
+    record_dir: Path,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build metadata shared by final and periodic lightweight bundles."""
+    metadata = {
+        "model_name": args.output_name,
+        "algorithm": algorithm_name,
+        "obs_mode": env_config.get("observation_mode", args.observation_mode),
+        "observation_module": env_config.get("observation_module", ""),
+        "action_dim": 4,
+        "env_class": "DogFightWrapper",
+        "target_mode": args.target_mode,
+        "record_dir": str(record_dir),
+        "use_lstm": args.use_lstm,
+        "use_lstm_sac": args.use_lstm_sac,
+        "use_lstm_prioritized_replay": (
+            args.use_lstm_prioritized_replay if args.use_lstm_sac else None
+        ),
+        "lstm_cell_size": (
+            args.lstm_cell_size if args.use_lstm or args.use_lstm_sac else None
+        ),
+        "max_seq_len": (
+            args.max_seq_len if args.use_lstm or args.use_lstm_sac else None
+        ),
+        "lstm_scope": args.lstm_scope if args.use_lstm_sac else None,
+        "network_spec": (
+            json.loads(args.network_spec_json) if args.network_spec_json else None
+        ),
+    }
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
+def _save_lightweight_bundle(
+    algorithm,
+    bundle_dir: Path,
+    args,
+    algorithm_name: str,
+    env_config: dict,
+    record_dir: Path,
+    *,
+    label: str,
+    iteration: int | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Save a lightweight policy bundle with common metadata."""
+    metadata_extra = dict(extra or {})
+    if iteration is not None:
+        metadata_extra["iteration"] = iteration
+    save_lightweight_policy_bundle(
+        algorithm,
+        bundle_dir,
+        metadata=_build_bundle_metadata(
+            args,
+            algorithm_name,
+            env_config,
+            record_dir,
+            extra=metadata_extra,
+        ),
+    )
+    print(f"{label} lightweight bundle saved to {bundle_dir}")
+
+
+def _save_native_checkpoint(algorithm, checkpoint_dir: Path, *, label: str) -> None:
+    """Save an RLlib native checkpoint to the requested directory."""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = algorithm.save(str(checkpoint_dir))
+    print(f"{label} rllib checkpoint saved to {checkpoint_path}")
+
+
 def _save_tune_outputs(args, algorithm_name: str, config, env_config: dict, result_grid) -> None:
     from ray.rllib.algorithms.algorithm import Algorithm
 
@@ -929,43 +1014,19 @@ def _save_tune_outputs(args, algorithm_name: str, config, env_config: dict, resu
     try:
         bundle_dir = ROOT / "artifacts" / "models" / args.output_name / args.output_tag
         record_dir = ROOT / "artifacts" / "records" / args.output_name / args.output_tag
-        save_lightweight_policy_bundle(
-            algorithm,
-            bundle_dir,
-            metadata={
-                "model_name": args.output_name,
-                "algorithm": algorithm_name,
-                "obs_mode": env_config.get("observation_mode", args.observation_mode),
-                "observation_module": env_config.get("observation_module", ""),
-                "action_dim": 4,
-                "env_class": "DogFightWrapper",
-                "target_mode": args.target_mode,
-                "record_dir": str(record_dir),
-                "tune_checkpoint": str(checkpoint),
-                "use_lstm": args.use_lstm,
-                "use_lstm_sac": args.use_lstm_sac,
-                "use_lstm_prioritized_replay": (
-                    args.use_lstm_prioritized_replay if args.use_lstm_sac else None
-                ),
-                "lstm_cell_size": (
-                    args.lstm_cell_size
-                    if args.use_lstm or args.use_lstm_sac
-                    else None
-                ),
-                "max_seq_len": (
-                    args.max_seq_len
-                    if args.use_lstm or args.use_lstm_sac
-                    else None
-                ),
-                "lstm_scope": args.lstm_scope if args.use_lstm_sac else None,
-                "network_spec": (
-                    json.loads(args.network_spec_json)
-                    if args.network_spec_json
-                    else None
-                ),
-            },
-        )
-        print(f"lightweight bundle saved to {bundle_dir}")
+        if args.save_lightweight_bundle:
+            _save_lightweight_bundle(
+                algorithm,
+                bundle_dir,
+                args,
+                algorithm_name,
+                env_config,
+                record_dir,
+                label="final",
+                extra={"tune_checkpoint": str(checkpoint)},
+            )
+        else:
+            print("lightweight bundle save skipped by --no-save-lightweight-bundle")
 
         metrics = _json_safe(getattr(result, "metrics", {}) or {})
         if not args.disable_dashboard_log:
@@ -1016,7 +1077,7 @@ def _run_with_tune(args, algorithm_name: str, config, env_config: dict) -> None:
     tune_dir = ROOT / "artifacts" / "tune" / args.output_name
     trainable = algorithm_name.upper()
     checkpoint_config = CheckpointConfig(
-        checkpoint_frequency=args.checkpoint_frequency,
+        checkpoint_frequency=_native_checkpoint_frequency(args),
         checkpoint_at_end=True,
         num_to_keep=2,
     )
@@ -1060,7 +1121,7 @@ def main():
         "max_engage_time": args.max_engage_time,
         "episode_step_limit": args.episode_step_limit,
     }
-    _deep_update(env_config, _load_experiment_env_config(args.experiment_yaml))
+    deep_update(env_config, load_experiment_env_config(args.experiment_yaml, ROOT))
     if args.reward_module:
         env_config["reward_module"] = args.reward_module
     if args.observation_module:
@@ -1175,6 +1236,18 @@ def main():
     try:
         policy_probe_logger.__enter__()
         engagement_replay_logger.__enter__()
+        bundle_root = (
+            ROOT / "artifacts" / "models" / args.output_name / args.output_tag
+        )
+        checkpoint_root = (
+            ROOT / "artifacts" / "checkpoints" / args.output_name / args.output_tag
+        )
+        record_dir = (
+            ROOT / "artifacts" / "records" / args.output_name / args.output_tag
+        )
+        bundle_frequency = max(0, int(args.lightweight_bundle_frequency))
+        native_frequency = _native_checkpoint_frequency(args)
+
         for iteration in range(args.iterations):
             result = algorithm.train()
             env_metrics   = result.get("env_runners", {})
@@ -1235,6 +1308,30 @@ def main():
                 custom,
                 learner_stats,
             ))
+            iteration_number = iteration + 1
+            if args.save_lightweight_bundle and bundle_frequency > 0:
+                if iteration_number % bundle_frequency == 0:
+                    periodic_bundle_dir = bundle_root / f"bundle_{iteration_number:06d}"
+                    _save_lightweight_bundle(
+                        algorithm,
+                        periodic_bundle_dir,
+                        args,
+                        algorithm_name,
+                        env_config,
+                        record_dir,
+                        label=f"periodic iter {iteration_number}",
+                        iteration=iteration_number,
+                    )
+            if args.save_native_checkpoint and native_frequency > 0:
+                if iteration_number % native_frequency == 0:
+                    checkpoint_dir = (
+                        checkpoint_root / f"checkpoint_{iteration_number:06d}"
+                    )
+                    _save_native_checkpoint(
+                        algorithm,
+                        checkpoint_dir,
+                        label=f"periodic iter {iteration_number}",
+                    )
         csv_file.close()
         print(f"training log saved to {csv_path}")
         if dashboard_logger is not None:
@@ -1243,44 +1340,18 @@ def main():
             print(f"policy probe CSV saved to {policy_probe_logger.csv_path}")
             print(f"policy probe JSONL saved to {policy_probe_logger.jsonl_path}")
 
-        bundle_dir = ROOT / "artifacts" / "models" / args.output_name / args.output_tag
-        record_dir = ROOT / "artifacts" / "records" / args.output_name / args.output_tag
-        save_lightweight_policy_bundle(
-            algorithm,
-            bundle_dir,
-            metadata={
-                "model_name": args.output_name,
-                "algorithm": algorithm_name,
-                "obs_mode": env_config.get("observation_mode", args.observation_mode),
-                "observation_module": env_config.get("observation_module", ""),
-                "action_dim": 4,
-                "env_class": "DogFightWrapper",
-                "target_mode": args.target_mode,
-                "record_dir": str(record_dir),
-                "use_lstm": args.use_lstm,
-                "use_lstm_sac": args.use_lstm_sac,
-                "use_lstm_prioritized_replay": (
-                    args.use_lstm_prioritized_replay if args.use_lstm_sac else None
-                ),
-                "lstm_cell_size": (
-                    args.lstm_cell_size
-                    if args.use_lstm or args.use_lstm_sac
-                    else None
-                ),
-                "max_seq_len": (
-                    args.max_seq_len
-                    if args.use_lstm or args.use_lstm_sac
-                    else None
-                ),
-                "lstm_scope": args.lstm_scope if args.use_lstm_sac else None,
-                "network_spec": (
-                    json.loads(args.network_spec_json)
-                    if args.network_spec_json
-                    else None
-                ),
-            },
-        )
-        print(f"lightweight bundle saved to {bundle_dir}")
+        if args.save_lightweight_bundle:
+            _save_lightweight_bundle(
+                algorithm,
+                bundle_root,
+                args,
+                algorithm_name,
+                env_config,
+                record_dir,
+                label="final",
+            )
+        else:
+            print("lightweight bundle save skipped by --no-save-lightweight-bundle")
 
         save_training_record(
             output_dir=record_dir,
@@ -1295,10 +1366,11 @@ def main():
         print(f"training record saved to {record_dir}")
 
         if args.save_native_checkpoint:
-            native_checkpoint_dir = ROOT / "artifacts" / "checkpoints" / args.output_name / args.output_tag
-            native_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_path = algorithm.save(str(native_checkpoint_dir))
-            print(f"rllib checkpoint saved to {checkpoint_path}")
+            _save_native_checkpoint(
+                algorithm,
+                checkpoint_root / "checkpoint_final",
+                label="final",
+            )
     finally:
         policy_probe_logger.__exit__(None, None, None)
         engagement_replay_logger.__exit__(None, None, None)

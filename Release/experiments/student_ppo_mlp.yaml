@@ -57,8 +57,10 @@ runtime:
   num_envs_per_env_runner: 1
   rollout_fragment_length: auto
   batch_mode: truncate_episodes
-  checkpoint_frequency: 0
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 0
   save_native_checkpoint: false
+  native_checkpoint_frequency: 0
 
 # 6) 로그 설정
 dashboard:

@@ -138,6 +138,7 @@ class Fighter(object):
             vt.text = str(Init_Speed) #v.0.7
             doc.write(self._initPath)
             self.fighterID = JSBSim.Init(self._spaceID, self._fighterType, self._forceSide, self._delta)
+            # print("[JSBSimWrapper] figherID = ", self.fighterID)
 
     def get_initPath(self):
         return self._initPath

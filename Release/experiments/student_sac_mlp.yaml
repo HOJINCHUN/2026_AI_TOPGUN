@@ -12,18 +12,18 @@ script: train_rllib
 # - output.name: 팀 이름 또는 실험 그룹 이름
 # - output.tag: 모델/로그 저장 하위 이름
 output:
-  name: team01
+  name: test_mlp
   tag: sac_mlp_v1
 
 # 1) 시나리오 선택
-# - observation_mode: classic12 | relative14 | tactical16 | legacy37 | custom
+# - observation_mode: classic12 | relative14 | tactical16 | custom
 # - custom 관측을 쓰려면 observation_mode: custom + observation_module 사용
 # - target_mode: fixed | loiter | autopilot | behavior_tree
 # - behavior_tree는 target_behavior_dll 필요
 env:
   observation_mode: tactical16
   # observation_module: student.my_observation
-  target_mode: fixed
+  target_mode: behavior_tree
   target_behavior_dll: AIP_BASE_target.dll
   # reward_module: student.my_reward
   max_engage_time: 60.0
@@ -86,8 +86,10 @@ runtime:
   num_envs_per_env_runner: 1
   rollout_fragment_length: auto
   batch_mode: truncate_episodes
-  checkpoint_frequency: 0
-  save_native_checkpoint: false
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 5
+  save_native_checkpoint: true
+  native_checkpoint_frequency: 25
   # 학습 재개:
   # restore_checkpoint: artifacts/checkpoints/team01/sac_mlp_v1/checkpoint_000010
   # init_bundle: artifacts/models/team01/sac_mlp_v1

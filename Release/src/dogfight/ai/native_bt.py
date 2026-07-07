@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes as ct
 import os
 import struct
+import sys
 
 
 class J_NavigationData(ct.Structure):
@@ -101,7 +102,18 @@ lib_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.pa
 class AIPilot:
     def __init__(self, filename: str = "AIP_DCS_ownship.dll"):
         path_to_so_file = os.path.join(lib_path, filename)
-        self.AIPilotDLL = ct.cdll.LoadLibrary(path_to_so_file)
+        self.dll_path = os.path.abspath(path_to_so_file)
+        self.debug_enabled = os.getenv("DOGFIGHT_BT_DEBUG", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not os.path.exists(self.dll_path):
+            raise FileNotFoundError(f"BT DLL not found: {self.dll_path}")
+        # 2026-05-26: Keep DLL path visible when diagnosing ctypes crashes.
+        self._debug_log(f"loading dll={self.dll_path}")
+        self.AIPilotDLL = ct.cdll.LoadLibrary(self.dll_path)
 
         self.AIPilotDLL.CreateBehaviorTree.argtypes = [ct.c_int, ct.c_int]
         self.AIPilotDLL.CreateBehaviorTree.restype = None
@@ -121,8 +133,25 @@ class AIPilot:
         self.AIPilotDLL.RemoveBT.argtypes = [ct.c_int]
         self.AIPilotDLL.RemoveBT.restype = None
 
+    def _debug_log(self, message: str) -> None:
+        if self.debug_enabled:
+            print(f"[native_bt] {message}", file=sys.stderr)
+
     def CreateBehaviorTree(self, my_id, my_force_id):
-        self.AIPilotDLL.CreateBehaviorTree(my_id, my_force_id)
+        self._debug_log(
+            f"before CreateBehaviorTree dll={self.dll_path} "
+            f"my_id={my_id} force={my_force_id}"
+        )
+        try:
+            self.AIPilotDLL.CreateBehaviorTree(my_id, my_force_id)
+        except OSError as exc:
+            raise OSError(
+                "CreateBehaviorTree failed "
+                f"dll={self.dll_path} my_id={my_id} force={my_force_id}"
+            ) from exc
+        self._debug_log(
+            f"after CreateBehaviorTree my_id={my_id} force={my_force_id}"
+        )
 
     @staticmethod
     def BuildPlaneData(location_xyz, rotation_rpy, speed: float, team: int) -> OPlaneData:
@@ -145,17 +174,36 @@ class AIPilot:
         b_lockon = False
         b_flare = ct.c_bool()
         b_launch_missile = ct.c_bool()
-        my_opd = self.AIPilotDLL.ChangeData(my_id, my_force_id, 100.0, 0, ct.POINTER(J_NavigationData)(my_navi))
-        tgt_opd = self.AIPilotDLL.ChangeData(tgt_id, tgt_force_id, 100.0, 0, ct.POINTER(J_NavigationData)(tgt_navi))
-        target_buffer = self._pack_plane_data_buffer(tgt_opd)
-        return self.AIPilotDLL.Step(
-            ct.byref(my_opd),
-            1,
-            ct.cast(target_buffer, ct.c_void_p),
-            b_lockon,
-            ct.byref(b_flare),
-            ct.byref(b_launch_missile),
-        )
+        try:
+            my_opd = self.AIPilotDLL.ChangeData(
+                my_id,
+                my_force_id,
+                100.0,
+                0,
+                ct.POINTER(J_NavigationData)(my_navi),
+            )
+            tgt_opd = self.AIPilotDLL.ChangeData(
+                tgt_id,
+                tgt_force_id,
+                100.0,
+                0,
+                ct.POINTER(J_NavigationData)(tgt_navi),
+            )
+            target_buffer = self._pack_plane_data_buffer(tgt_opd)
+            return self.AIPilotDLL.Step(
+                ct.byref(my_opd),
+                1,
+                ct.cast(target_buffer, ct.c_void_p),
+                b_lockon,
+                ct.byref(b_flare),
+                ct.byref(b_launch_missile),
+            )
+        except OSError as exc:
+            raise OSError(
+                "BT Step failed "
+                f"dll={self.dll_path} my_id={my_id} force={my_force_id} "
+                f"target_id={tgt_id} target_force={tgt_force_id}"
+            ) from exc
 
     def StepWithPlaneData(
         self,
@@ -166,14 +214,22 @@ class AIPilot:
         b_flare = ct.c_bool()
         b_launch_missile = ct.c_bool()
         target_buffer = self._pack_plane_data_buffer(target_plane)
-        return self.AIPilotDLL.Step(
-            ct.byref(my_plane),
-            1,
-            ct.cast(target_buffer, ct.c_void_p),
-            ct.c_bool(bool(is_locked_on)),
-            ct.byref(b_flare),
-            ct.byref(b_launch_missile),
-        )
+        try:
+            return self.AIPilotDLL.Step(
+                ct.byref(my_plane),
+                1,
+                ct.cast(target_buffer, ct.c_void_p),
+                ct.c_bool(bool(is_locked_on)),
+                ct.byref(b_flare),
+                ct.byref(b_launch_missile),
+            )
+        except OSError as exc:
+            raise OSError(
+                "BT StepWithPlaneData failed "
+                f"dll={self.dll_path} my_id={my_plane.Resv0} "
+                f"force={my_plane.Team} target_id={target_plane.Resv0} "
+                f"target_force={target_plane.Team}"
+            ) from exc
 
     @staticmethod
     def _pack_plane_data_buffer(plane: OPlaneData):
@@ -194,14 +250,33 @@ class AIPilot:
         return ct.create_string_buffer(packed)
 
     def GetVP(self, my_id, my_force_id, my_navi):
-        my_opd = self.AIPilotDLL.ChangeData(my_id, my_force_id, 100.0, 0, ct.POINTER(J_NavigationData)(my_navi))
-        return self.AIPilotDLL.GetVP(ct.byref(my_opd))
+        try:
+            my_opd = self.AIPilotDLL.ChangeData(
+                my_id,
+                my_force_id,
+                100.0,
+                0,
+                ct.POINTER(J_NavigationData)(my_navi),
+            )
+            return self.AIPilotDLL.GetVP(ct.byref(my_opd))
+        except OSError as exc:
+            raise OSError(
+                "BT GetVP failed "
+                f"dll={self.dll_path} my_id={my_id} force={my_force_id}"
+            ) from exc
 
     def GetVPWithPlaneData(self, my_plane: OPlaneData):
-        return self.AIPilotDLL.GetVP(ct.byref(my_plane))
+        try:
+            return self.AIPilotDLL.GetVP(ct.byref(my_plane))
+        except OSError as exc:
+            raise OSError(
+                "BT GetVPWithPlaneData failed "
+                f"dll={self.dll_path} my_id={my_plane.Resv0} force={my_plane.Team}"
+            ) from exc
 
     def Reset(self):
         self.AIPilotDLL.Reset()
 
     def RemoveBT(self, my_id):
+        self._debug_log(f"RemoveBT my_id={my_id}")
         self.AIPilotDLL.RemoveBT(my_id)

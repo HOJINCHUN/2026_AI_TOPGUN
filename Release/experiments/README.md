@@ -35,7 +35,7 @@ C:\Users\USER\anaconda3\envs\aip\python.exe scripts\run_experiment.py experiment
 |---|---|
 | `output.name` | 팀 이름 또는 실험 그룹 이름 |
 | `output.tag` | 저장될 모델/로그 버전 이름 |
-| `env.observation_mode` | `classic12`, `relative14`, `tactical16`, `legacy37`, `custom` |
+| `env.observation_mode` | `classic12`, `relative14`, `tactical16`, `custom` |
 | `env.observation_module` | `student.my_observation` 같은 custom 관측 module path |
 | `env.target_mode` | `fixed`, `loiter`, `autopilot`, `behavior_tree` |
 | `env_config.initial_scenario` | reset 시 초기 배치와 target type 분포 설정 |
@@ -43,14 +43,32 @@ C:\Users\USER\anaconda3\envs\aip\python.exe scripts\run_experiment.py experiment
 | `env_config.reward` | 기본 보상 scale 조정 |
 | `algo.name` | `sac` 또는 `ppo` |
 | `algo.lr`, `gamma`, `train_batch_size` | 주요 학습 하이퍼파라미터 |
+
+`legacy37`와 `ref_old_1vs1`은 연구 비교용 계약이므로 학생 배포본에서는 기본
+노출하지 않습니다. 해당 실험은 `MyTrainEnv/`의 ref_old 비교 YAML을 기준으로
+관리합니다.
 | `algo.mlp` | MLP hidden layer/activation 설정 |
 | `algo.lstm` | LSTM 사용, hidden size, sequence length 설정 |
 | `algo.network` | SAC LSTM sequence 구조를 layer 순서로 직접 지정 |
 | `runtime.iterations` | 학습 iteration 수 |
+| `runtime.save_lightweight_bundle` | 추론용 lightweight bundle 저장 여부 |
+| `runtime.lightweight_bundle_frequency` | N iteration마다 bundle snapshot 저장, `0`은 최종본만 저장 |
+| `runtime.save_native_checkpoint` | RLlib native checkpoint 저장 여부 |
+| `runtime.native_checkpoint_frequency` | N iteration마다 native checkpoint 저장, `0`은 최종본만 저장 |
 | `runtime.init_bundle` | lightweight bundle weight에서 새 학습 시작 |
 | `runtime.restore_checkpoint` | RLlib native checkpoint에서 전체 학습 상태 복원 |
 | `policy_probe` | 학습 중 고정 입력 actor 출력/state 로그 |
 | `engagement_log` | 학습 중 짧은 평가 교전 Tacview CSV 저장 |
+
+저장 위치:
+
+- lightweight bundle 최종본: `artifacts/models/<output.name>/<output.tag>`
+- lightweight bundle 주기 저장: `artifacts/models/<output.name>/<output.tag>/bundle_000010`
+- native checkpoint 최종본: `artifacts/checkpoints/<output.name>/<output.tag>/checkpoint_final`
+- native checkpoint 주기 저장: `artifacts/checkpoints/<output.name>/<output.tag>/checkpoint_000010`
+
+기존 `runtime.checkpoint_frequency`는 호환 alias입니다. 새 YAML에서는
+`runtime.native_checkpoint_frequency`를 사용합니다.
 
 ## 판단 근거
 
@@ -64,3 +82,5 @@ C:\Users\USER\anaconda3\envs\aip\python.exe scripts\run_experiment.py experiment
 - SAC LSTM은 Ray/RLlib 설치본 패치가 필요한 고급 기능이므로 `student_sac_lstm.yaml`에
   명시했습니다. 패치가 없는 환경에서는 `student_sac_mlp.yaml` 또는 PPO 템플릿을 먼저
   사용합니다.
+- lightweight bundle은 제출/추론용 weight 산출물이고 native checkpoint는 학습 상태
+  복구용 산출물이므로 저장 여부와 주기를 분리합니다.

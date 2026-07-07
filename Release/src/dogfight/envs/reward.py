@@ -19,6 +19,13 @@ def compute_reward(
 
     components keys: step, pursuit, damage, safety, terminal
     """
+    reward_mode = reward_config.get("mode", "default")
+    if reward_mode not in (None, "default"):
+        raise ValueError(
+            f"Release reward mode {reward_mode!r} is not supported. "
+            "Research-only reward modes such as ref_old_1vs1 live in MyTrainEnv."
+        )
+
     components: dict[str, float] = {}
 
     # ── 0. Survival bonus (curriculum Stage 0 only, defaults to 0) ────────

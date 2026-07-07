@@ -83,6 +83,15 @@ class DogFightEnv(gym.Env):
         observation_high=None,
     ):
         super().__init__()
+        self._closed = False
+        self.battle_space_id: int | None = None
+        self._sim = None
+        self._target_sim = None
+        self._ownship_ai = None
+        self._target_ai = None
+        self._ownship_action_provider = ownship_action_provider
+        self._target_action_provider = target_action_provider
+
         self.config = merge_env_config(env_config)
         self._runner_index = self.config.get("_runner_index", "local")
         self._env_index = self.config.get("_env_index", 0)
@@ -98,13 +107,10 @@ class DogFightEnv(gym.Env):
         self._wez = self.config["wez"]
         self._reward_config = self.config["reward"]
         self._artifacts_dir = self.config["artifacts_dir"]
-        self._closed = False
         self._reward_fn = reward_fn  # None → compute_reward from reward.py
         self._observation_fn = observation_fn
 
         self.battle_space_id = JSBSimWrapper.create_battleSpace()
-        self._ownship_action_provider = ownship_action_provider
-        self._target_action_provider = target_action_provider
         self._ownship_ai = (
             AIP_ownship if AIP_ownship is not None else self._build_ownship_ai()
         )
@@ -283,33 +289,9 @@ class DogFightEnv(gym.Env):
 
     def step(self, action) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         action = np.asarray(action, dtype=np.float32)
-        ownship_damage_total = 0.0
-        target_damage_total = 0.0
-        in_wez_any = False
-        for _ in range(int(self._step_ratio)):
-            self._step_controlled_aircraft(action)
-            if np.isnan(self._sim.get_state()).any():
-                info = {"end_condition": "Ownship FDM output Fall", "outcome": "crash"}
-                self._ep_step_count += 1
-                self._print_episode_termination(info["end_condition"])
-                return np.array(self.pre_obs, dtype=np.float32), 0.0, True, False, info
-
-            self._step_target_aircraft()
-            if np.isnan(self._target_sim.get_state()).any():
-                info = {"end_condition": "Target FDM output Fall", "outcome": "other"}
-                self._ep_step_count += 1
-                self._print_episode_termination(info["end_condition"])
-                return np.array(self.pre_obs, dtype=np.float32), 0.0, True, False, info
-
-            self.update_damage()
-            ownship_damage_total += float(self.ownship_damage)
-            target_damage_total += float(self.target_damage)
-            in_wez_any = in_wez_any or self._in_wez
-            self._ownship_state = self._sim.get_state()
-            self._target_state = self._target_sim.get_state()
-        self.ownship_damage = ownship_damage_total
-        self.target_damage = target_damage_total
-        self._in_wez = in_wez_any
+        failure = self._advance_simulation_step_ratio(action)
+        if failure is not None:
+            return failure
         cur_obs = self.get_observation()
 
         terminated, truncated, end_condition = evaluate_termination(
@@ -327,56 +309,24 @@ class DogFightEnv(gym.Env):
 
         ownship_health = float(self._ownship_state[StateIndex.HEALTH])
         target_health = float(self._target_state[StateIndex.HEALTH])
-
-        # Classify episode outcome
-        if terminated:
-            if target_health <= 0.0 < ownship_health:
-                outcome = "win"
-            elif ownship_health <= 0.0 < target_health:
-                outcome = "loss"
-            elif end_condition in ("ownship altitude below min", "FDM Update Fail"):
-                outcome = "crash"
-            elif end_condition == "two circle headon guard fail":
-                outcome = "loss"
-            else:
-                outcome = "draw"
-        elif truncated:
-            outcome = "timeout"
-        else:
-            outcome = "ongoing"
-
-        # 보상 계산: 학생 정의 함수가 있으면 사용, 없으면 reward.py 기본값 사용
-        _reward_fn = self._reward_fn if self._reward_fn is not None else compute_reward
-        reward, components = _reward_fn(
-            self._ownship_state,
-            self._target_state,
-            self.ownship_damage,
-            self.target_damage,
-            self._geo_info,
-            self._wez,
-            self._reward_config,
+        outcome = self._classify_outcome(
+            terminated,
+            truncated,
+            end_condition,
+            ownship_health,
+            target_health,
+        )
+        reward, components = self._compute_step_reward(
             terminated,
             truncated,
             end_condition,
         )
 
-        # Accumulate episode-level statistics
-        distance = self._geo_info._get_distance(self._ownship_state, self._target_state)
-        self._ep_step_count += 1
-        self._ep_total_reward += float(reward)
-        self._ep_distance_sum += distance
-        self._ep_distance_min = min(self._ep_distance_min, distance)
-        if self._in_wez:
-            self._ep_wez_steps += 1
-        if components.get("safety", 0.0) < 0.0:
-            self._ep_altitude_penalty_steps += 1
-        for k, v in components.items():
-            self._ep_reward_components[k] = self._ep_reward_components.get(k, 0.0) + v
-        self._ep_action_sum += action.astype(np.float64)
-        self._ep_action_sq_sum += action.astype(np.float64) ** 2
-
-        ep_mean_dist = self._ep_distance_sum / self._ep_step_count
-        ep_min_dist = self._ep_distance_min if self._ep_step_count > 0 else 0.0
+        ep_mean_dist, ep_min_dist = self._update_episode_metrics(
+            action,
+            reward,
+            components,
+        )
 
         self.info = {
             "end_condition": end_condition,
@@ -408,6 +358,106 @@ class DogFightEnv(gym.Env):
         if terminated or truncated:
             self._print_episode_termination(end_condition)
         return np.array(cur_obs, dtype=np.float32), reward, terminated, truncated, dict(self.info)
+
+    def _advance_simulation_step_ratio(
+        self,
+        action: np.ndarray,
+    ) -> tuple[np.ndarray, float, bool, bool, Dict] | None:
+        ownship_damage_total = 0.0
+        target_damage_total = 0.0
+        in_wez_any = False
+        for _ in range(int(self._step_ratio)):
+            self._step_controlled_aircraft(action)
+            if np.isnan(self._sim.get_state()).any():
+                info = {"end_condition": "Ownship FDM output Fall", "outcome": "crash"}
+                self._ep_step_count += 1
+                self._print_episode_termination(info["end_condition"])
+                return np.array(self.pre_obs, dtype=np.float32), 0.0, True, False, info
+
+            self._step_target_aircraft()
+            if np.isnan(self._target_sim.get_state()).any():
+                info = {"end_condition": "Target FDM output Fall", "outcome": "other"}
+                self._ep_step_count += 1
+                self._print_episode_termination(info["end_condition"])
+                return np.array(self.pre_obs, dtype=np.float32), 0.0, True, False, info
+
+            self.update_damage()
+            ownship_damage_total += float(self.ownship_damage)
+            target_damage_total += float(self.target_damage)
+            in_wez_any = in_wez_any or self._in_wez
+            self._ownship_state = self._sim.get_state()
+            self._target_state = self._target_sim.get_state()
+
+        self.ownship_damage = ownship_damage_total
+        self.target_damage = target_damage_total
+        self._in_wez = in_wez_any
+        return None
+
+    @staticmethod
+    def _classify_outcome(
+        terminated: bool,
+        truncated: bool,
+        end_condition: str,
+        ownship_health: float,
+        target_health: float,
+    ) -> str:
+        if terminated:
+            if target_health <= 0.0 < ownship_health:
+                return "win"
+            if ownship_health <= 0.0 < target_health:
+                return "loss"
+            if end_condition in ("ownship altitude below min", "FDM Update Fail"):
+                return "crash"
+            if end_condition == "two circle headon guard fail":
+                return "loss"
+            return "draw"
+        if truncated:
+            return "timeout"
+        return "ongoing"
+
+    def _compute_step_reward(
+        self,
+        terminated: bool,
+        truncated: bool,
+        end_condition: str,
+    ) -> tuple[float, dict]:
+        _reward_fn = self._reward_fn if self._reward_fn is not None else compute_reward
+        return _reward_fn(
+            self._ownship_state,
+            self._target_state,
+            self.ownship_damage,
+            self.target_damage,
+            self._geo_info,
+            self._wez,
+            self._reward_config,
+            terminated,
+            truncated,
+            end_condition,
+        )
+
+    def _update_episode_metrics(
+        self,
+        action: np.ndarray,
+        reward: float,
+        components: dict,
+    ) -> tuple[float, float]:
+        distance = self._geo_info._get_distance(self._ownship_state, self._target_state)
+        self._ep_step_count += 1
+        self._ep_total_reward += float(reward)
+        self._ep_distance_sum += distance
+        self._ep_distance_min = min(self._ep_distance_min, distance)
+        if self._in_wez:
+            self._ep_wez_steps += 1
+        if components.get("safety", 0.0) < 0.0:
+            self._ep_altitude_penalty_steps += 1
+        for k, v in components.items():
+            self._ep_reward_components[k] = self._ep_reward_components.get(k, 0.0) + v
+        self._ep_action_sum += action.astype(np.float64)
+        self._ep_action_sq_sum += action.astype(np.float64) ** 2
+
+        ep_mean_dist = self._ep_distance_sum / self._ep_step_count
+        ep_min_dist = self._ep_distance_min if self._ep_step_count > 0 else 0.0
+        return ep_mean_dist, ep_min_dist
 
     @staticmethod
     def _resolve_step_ratio(config: dict) -> float:
@@ -484,29 +534,29 @@ class DogFightEnv(gym.Env):
         return self._build_observation_for(self._ownship_state, self._target_state)
 
     def _build_observation_for(self, ownship_state, target_state) -> np.ndarray:
-        wez_cfg = self._wez if self._observation_mode == "tactical16" else None
-        if self._observation_fn is None:
-            return build_observation(
-                self._observation_mode,
-                ownship_state,
-                target_state,
+        if self._observation_fn is not None:
+            observation = self._observation_fn(
+                np.array(ownship_state, copy=True),
+                np.array(target_state, copy=True),
                 self._geo_info,
-                wez_cfg,
+                self._wez,
             )
+            observation = np.asarray(observation, dtype=np.float32)
+            if observation.shape != (self.num_observation,):
+                raise ValueError(
+                    "custom observation_fn returned shape "
+                    f"{observation.shape}, expected {(self.num_observation,)}"
+                )
+            return observation
 
-        observation = self._observation_fn(
+        wez_cfg = self._wez if self._observation_mode == "tactical16" else None
+        return build_observation(
+            self._observation_mode,
             ownship_state,
             target_state,
             self._geo_info,
-            self._wez,
+            wez_cfg,
         )
-        observation = np.asarray(observation, dtype=np.float32)
-        if observation.shape != (self.num_observation,):
-            raise ValueError(
-                "custom observation shape mismatch: "
-                f"expected {(self.num_observation,)}, got {observation.shape}"
-            )
-        return observation
 
     def get_reward(self):
         terminated, truncated, end_condition = evaluate_termination(
@@ -1014,28 +1064,45 @@ class DogFightEnv(gym.Env):
         return None
 
     def close(self):
-        if self._closed:
+        if getattr(self, "_closed", True):
             return
-        for provider in (self._ownship_action_provider, self._target_action_provider):
+        self._closed = True
+        providers = (
+            getattr(self, "_ownship_action_provider", None),
+            getattr(self, "_target_action_provider", None),
+        )
+        for provider in providers:
             if provider is not None:
                 try:
                     provider.close()
                 except Exception:
                     pass
-        for sim, ai in ((getattr(self, "_sim", None), self._ownship_ai), (getattr(self, "_target_sim", None), self._target_ai)):
-            if ai is not None and sim is not None and getattr(sim, "_model", None) is not None:
+        sim_ai_pairs = (
+            (getattr(self, "_sim", None), getattr(self, "_ownship_ai", None)),
+            (getattr(self, "_target_sim", None), getattr(self, "_target_ai", None)),
+        )
+        for sim, ai in sim_ai_pairs:
+            if (
+                ai is not None
+                and sim is not None
+                and getattr(sim, "_model", None) is not None
+            ):
                 try:
                     ai.RemoveBT(sim.get_model().fighterID)
                 except Exception:
                     pass
-        try:
-            JSBSimWrapper.RemoveSpace(self.battle_space_id)
-        except Exception:
-            pass
-        self._closed = True
+        battle_space_id = getattr(self, "battle_space_id", None)
+        if battle_space_id is not None:
+            try:
+                JSBSimWrapper.RemoveSpace(battle_space_id)
+            except Exception:
+                pass
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 __all__ = ["DogFightEnv", "normalize", "FEET_TO_METER", "METER_TO_FEET"]

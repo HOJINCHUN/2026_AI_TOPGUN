@@ -167,17 +167,40 @@ replay buffer 등 학습 상태를 이어받아 같은 학습을 계속할 때 �
 C:\Users\USER\anaconda3\envs\aip\python.exe train_rllib.py `
   --algorithm sac `
   --iterations 50 `
+  --lightweight-bundle-frequency 10 `
   --save-native-checkpoint `
+  --native-checkpoint-frequency 10 `
   --output-name team01 `
   --output-tag v1
 
 C:\Users\USER\anaconda3\envs\aip\python.exe train_rllib.py `
   --algorithm sac `
   --iterations 50 `
-  --restore-checkpoint artifacts\checkpoints\team01\v1 `
+  --restore-checkpoint artifacts\checkpoints\team01\v1\checkpoint_000010 `
   --output-name team01 `
   --output-tag v1_resume
 ```
+
+저장 위치:
+
+- lightweight bundle 최종본: `artifacts\models\<output-name>\<output-tag>`
+- lightweight bundle 주기 저장: `artifacts\models\<output-name>\<output-tag>\bundle_000010`
+- native checkpoint 최종본: `artifacts\checkpoints\<output-name>\<output-tag>\checkpoint_final`
+- native checkpoint 주기 저장: `artifacts\checkpoints\<output-name>\<output-tag>\checkpoint_000010`
+
+YAML에서는 `runtime` 아래에서 두 저장 정책을 따로 설정합니다.
+
+```yaml
+runtime:
+  save_lightweight_bundle: true
+  lightweight_bundle_frequency: 0
+  save_native_checkpoint: true
+  native_checkpoint_frequency: 10
+```
+
+`0` 주기는 최종본만 저장한다는 뜻입니다. 기존 `checkpoint_frequency`는 오래된
+YAML/CLI 호환용으로 남아 있으며, 새 실험에서는 `native_checkpoint_frequency`를
+사용합니다.
 
 커리큘럼은 기존 중단 학습을 이어갈 때 `--resume`을 우선 사용합니다. 특정
 checkpoint에서 새 커리큘럼 run을 시작하려면 `--restore-checkpoint`를 사용합니다.
@@ -432,7 +455,57 @@ C:\Users\USER\anaconda3\envs\aip\python.exe run_local_dogfight.py `
   --save-log
 ```
 
-## 11. 제출 실행
+`--save-log`를 켜면 정상 episode 종료 후 `logs/` 아래에 같은 timestamp의
+ownship CSV, target CSV, summary JSON이 생성됩니다. CSV에는 Tacview/Replay 탭에서
+읽는 시간, 위도/경도, 고도, 자세, Health가 들어가고, summary JSON에는
+`end_condition`, `outcome`, 양측 Health가 들어갑니다.
+
+이 로그는 제출 전 로컬 교전 복기용 표준 절차입니다. 다만 provider 예외,
+`KeyboardInterrupt`, reset/build 실패처럼 정상 종료 블록에 도달하지 못한 경우까지
+항상 보존하는 crash dump 기능은 아닙니다. NaN 조기 종료 경로도 마지막 실패 프레임이
+완전히 남지 않을 수 있으므로, 이 경우에는 터미널 종료 사유와 함께 확인합니다.
+
+판단 근거:
+
+- `run_local_dogfight.py --save-log`는 episode loop가 `terminated` 또는 `truncated`로
+  끝난 뒤 `env.make_tacviewLog()`를 호출합니다.
+- 환경은 정상 `step()` 경로에서 매 step `ownship_log`와 `target_log`를 누적하고,
+  `make_tacviewLog()`에서 두 CSV와 summary JSON을 씁니다.
+- 종료 조건은 FDM update fail, 고도 하한, 기체 destroyed, fuel fail, timeout,
+  episode step limit 등을 포함합니다.
+
+## 11. Ray/RLlib와 ONNX 확장 구조
+
+현재 기본 학습 경로는 Ray/RLlib가 `DogFightWrapper` 환경을 감싸는 구조입니다.
+Ray/RLlib는 rollout 수집, 학습 루프, checkpoint, lightweight bundle 저장을 담당하고,
+환경 자체는 `reset()`/`step()`과 observation/action 계약을 제공합니다.
+
+따라서 강의 관점에서는 다음 구조로 분리해 설명할 수 있습니다.
+
+1. `DogFightWrapper` 또는 동일한 환경 계약을 직접 호출해 PyTorch/TensorFlow 학습 루프를
+   작성합니다.
+2. 학습된 neural network를 ONNX로 export합니다.
+3. ONNX Runtime 등으로 inference를 수행해 4차원 action `[roll, pitch, rudder, throttle]`
+   을 반환합니다.
+4. 그 inference 코드를 `ActionProvider.compute_action()` 계약으로 감싸면 local/Unreal
+   추론 경로에 공통으로 연결할 수 있습니다.
+
+주의할 점은 현재 `run_local_dogfight.py`와 `run_unreal_inference.py`가 바로 지원하는
+RL backend는 RLlib lightweight bundle(`metadata.json`, `policy_weights.pkl.gz`)이라는
+점입니다. ONNX 파일을 현재 CLI에 그대로 넣어 실행하는 기능은 아직 구현되어 있지
+않습니다. 실제 ONNX 연결이 필요하면 `ActionProvider`를 구현하는 ONNX adapter와 CLI
+옵션을 추가해야 합니다.
+
+판단 근거:
+
+- local/Unreal 추론은 모두 `ActionProvider.compute_action()`이 반환하는 4차원 action을
+  사용합니다.
+- `run_local_dogfight.py`는 ownship/target provider를 환경에 주입하고,
+  `run_unreal_inference.py`는 provider를 `ProviderCommandPolicy`에 주입합니다.
+- 이 연결 지점은 RLlib bundle, BT DLL, hybrid provider가 이미 공유하는 추상화이므로
+  ONNX 추론도 같은 adapter 패턴으로 확장하는 것이 가장 작고 안전한 변경입니다.
+
+## 12. 제출 실행
 
 `student/my_submission.py`의 `BUNDLE_DIR`, `TEAM_NAME`, `SERVER_IP`를 설정한 뒤 실행합니다.
 BT 또는 hybrid 제출은 `BT_DLL`과 `BT_RULE_XML`도 팀 파일명에 맞춥니다.
@@ -464,7 +537,7 @@ C:\Users\USER\anaconda3\envs\aip\python.exe run_unreal_inference.py `
   --action-repeat 6
 ```
 
-## 12. 판단 근거 및 적용 범위
+## 13. 판단 근거 및 적용 범위
 
 - 이번 단순화는 `Release/`에만 적용했습니다. `MyTrainEnv/`는 내부 작업/검증용 구현을
   유지합니다.
@@ -482,5 +555,7 @@ C:\Users\USER\anaconda3\envs\aip\python.exe run_unreal_inference.py `
 - SAC LSTM/RNNSAC 실험은 RLlib 내부 패치가 필요한 고급 경로이므로, 일반 학생
   템플릿과 분리해 `RLLibLstm/` 가이드를 기준으로 적용합니다. DLL, XML,
   aircraft/engine 자산은 여전히 이름 변경, 이동, 삭제 대상이 아닙니다.
+- ONNX는 현재 즉시 실행 가능한 CLI 입력 형식이 아니라 확장 가능한 inference 구조로
+  설명합니다. 실제 사용 시에는 `ActionProvider` 기반 adapter 구현이 필요합니다.
 - Release Word 매뉴얼은 `LogDevelop/Release_SAC_LSTM_User_Manual.docx`로 별도
   작성해 학생 실습 절차와 고급 LSTM 연구 절차를 구분합니다.

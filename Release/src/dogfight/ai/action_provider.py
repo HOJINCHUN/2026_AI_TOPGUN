@@ -43,4 +43,7 @@ class ActionProvider(ABC):
 def clip_action(action, low=None, high=None) -> np.ndarray:
     low = DEFAULT_ACTION_LOW if low is None else np.asarray(low, dtype=np.float32)
     high = DEFAULT_ACTION_HIGH if high is None else np.asarray(high, dtype=np.float32)
-    return np.clip(np.asarray(action, dtype=np.float32), low, high)
+    action_array = np.asarray(action, dtype=np.float32)
+    # 2026-05-26: Guard native DLL outputs before they can propagate NaN/Inf.
+    action_array = np.nan_to_num(action_array, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(action_array, low, high)

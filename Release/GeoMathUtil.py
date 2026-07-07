@@ -128,13 +128,6 @@ class GeometryInfo():
             T = np.matmul(Tx, np.matmul(Ty, Tz))
             p_unit_t = np.matmul(T, p_unit_ned)
             _angle = np.arccos(np.clip(p_unit_t[0], -1.0, 1.0))*R2D
-            # 3D에서는 부호가 정의가 안되서... 아래는 수정이 필요할 수 있다.
-            sign = 1
-            if p_unit_t[1] < -0.10:
-                sign = -1
-            elif -0.01 < p_unit_t[1] < 0.01:
-                sign = np.sign(p_unit_t[2])
-            _angle = sign*np.arccos(np.clip(p_unit_t[0], -1.0, 1.0))*R2D
 
         return _angle
 

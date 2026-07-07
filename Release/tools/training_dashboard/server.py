@@ -7,8 +7,8 @@ from pathlib import Path
 
 
 ENV_ROOT = Path(__file__).resolve().parents[2]
-COMMON_TOOLS = ENV_ROOT.parent / "tools"
-sys.path.insert(0, str(COMMON_TOOLS))
+RELEASE_TOOLS = ENV_ROOT / "tools"
+sys.path.insert(0, str(RELEASE_TOOLS))
 
 from dogfight_dashboard.server import main  # noqa: E402
 
